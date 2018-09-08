@@ -1,0 +1,6 @@
+* I need to figure out dependencies. At this point, we need to make something like this:
+    * one crate for each module - "super-foo"
+    * one base crate, which contains all the top level items - "super-base"
+    * one super crate, which exports all other crate. - "super"
+
+* Once these dependencies workish, I need to figure out how to import items from "super-base" in at least every sub crate, and maybe every module too?
