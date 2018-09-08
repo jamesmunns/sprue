@@ -1,4 +1,5 @@
 #![recursion_limit = "1024"]
+#![allow(intra_doc_link_resolution_failure)]
 extern crate getopts;
 extern crate quote;
 extern crate syn;
@@ -9,12 +10,14 @@ extern crate failure;
 
 use quote::ToTokens;
 use syn::{Crate, Item, ItemKind, Ident};
-use syn::fold::*;
+use syn::fold::{noop_fold_crate, Folder, noop_fold_item};
 use log::LevelFilter;
 
 use std::fs::{DirBuilder, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+// use std::sync::{Arc, Mutex};
 
 mod opts;
 use opts::FormOpts;
@@ -28,7 +31,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Error> {
-    env_logger::Builder::new().filter_level(LevelFilter::Info).try_init().context("could not initialise env_logger")?;
+    env_logger::Builder::new().filter_level(LevelFilter::Trace).try_init().context("could not initialise env_logger")?;
 
     trace!("logging initialised");
     let try_parsed_args = FormOpts::from_args().context(
@@ -47,6 +50,7 @@ fn create_directory_structure<P: AsRef<Path>>(
 ) -> Result<(), Error> {
     info!("Started parsing the input as Rust. This can take a minute or two.");
     let parsed_crate = syn::parse_crate(&string_contents).map_err(err_msg).context("failed to parse crate")?;
+
     info!("Finished parsing");
 
     let base_dir = base_dir.as_ref();
@@ -56,64 +60,114 @@ fn create_directory_structure<P: AsRef<Path>>(
     )?;
     info!("Prepared target directory {}", base_dir.display());
 
-    let mut folder = FileIntoMods { current_dir: &base_dir };
+    let mut folder = FileIntoMods { current_dir: &base_dir, top_level: true };
 
     // Why doesn't syn::Fold::fold handle errors again?
     // TODO: catch panics?
     let new_contents = folder.fold_crate(parsed_crate);
     trace!("transformed module contents");
 
-    let lib_file_path = base_dir.join("lib.rs");
+    // AJM - create root crate
+    {
+        let dir_name = base_dir.join("root").join("src");
 
-    let mut file = File::create(&lib_file_path).context(
-        format_err!("Unable to create the file {}", lib_file_path.display())
-    )?;
-    debug!("Writing to file {}", lib_file_path.display());
-    write_all_tokens(&new_contents, &mut file).context("unable to write to lib.rs")?;
+        let mut dir_builder = DirBuilder::new();
+        info!("Creating directory {}", dir_name.display());
+        dir_builder
+            .recursive(true)
+            .create(dir_name.clone())
+            .unwrap_or_else(|err| {
+                panic!("building {} failed with {}", dir_name.display(), err)
+            });
+
+        let lib_file_path = dir_name.join("lib.rs");
+
+        let mut file = File::create(&lib_file_path).context(
+            format_err!("Unable to create the file {}", lib_file_path.display())
+        )?;
+        debug!("Writing to file {}", lib_file_path.display());
+        write_all_tokens(&new_contents, &mut file).context("unable to write to lib.rs")?;
+    }
+
     Ok(())
 }
 
 #[derive(Debug)]
 struct FileIntoMods<P: AsRef<Path> + Send + Sync> {
     current_dir: P,
+    top_level: bool,
 }
 impl<P: AsRef<Path> + Send + Sync> FileIntoMods<P> {
     fn sub_mod<Q: AsRef<Path>>(&self, path: Q) -> FileIntoMods<PathBuf> {
         FileIntoMods {
             current_dir: self.current_dir.as_ref().join(path),
+            top_level: false,
         }
     }
 }
 
 impl<P: AsRef<Path> + Send + Sync> FileIntoMods<P> {
     fn fold_sub_crate(&mut self, crate_name: &Ident, rust_crate: Crate) -> Result<(), Error> {
-        trace!("Folding over module {}", crate_name);
+        trace!("Folding over module {} - submod? - {}", crate_name, !self.top_level);
 
-        let dir_name = &self.current_dir.as_ref().join(crate_name.as_ref());
+        // AJM - todo dedupe code here
+        if self.top_level {
+            let dir_name = &self.current_dir.as_ref().join(crate_name.as_ref()).join("src");
 
-        let mut dir_builder = DirBuilder::new();
-        info!("Creating directory {}", dir_name.display());
-        dir_builder
-            .recursive(true)
-            .create(dir_name)
-            .unwrap_or_else(|err| {
-                panic!("building {} failed with {}", dir_name.display(), err)
+            let mut dir_builder = DirBuilder::new();
+            info!("Creating directory {}", dir_name.display());
+            dir_builder
+                .recursive(true)
+                .create(dir_name)
+                .unwrap_or_else(|err| {
+                    panic!("building {} failed with {}", dir_name.display(), err)
+                });
+
+            // AJM - make a Cargo.toml for the crate somewhere around here
+
+            let mut sub_self = self.sub_mod(crate_name.as_ref());
+            let folded_crate = noop_fold_crate(&mut sub_self, rust_crate);
+            trace!(
+                "Writing contents of module {} to file {}",
+                crate_name,
+                dir_name.display()
+            );
+
+            write_crate_crate(folded_crate, &dir_name).unwrap_or_else(|err| {
+                panic!(
+                    "writing to {}/lib.rs failed with {}",
+                    dir_name.display(),
+                    err
+                )
             });
+        } else {
+            let dir_name = &self.current_dir.as_ref().join(crate_name.as_ref());
 
-        let mut sub_self = self.sub_mod(crate_name.as_ref());
-        let folded_crate = noop_fold_crate(&mut sub_self, rust_crate);
-        trace!(
-            "Writing contents of module {} to file {}",
-            crate_name,
-            dir_name.display()
-        );
-        write_crate(folded_crate, &dir_name).unwrap_or_else(|err| {
-            panic!(
-                "writing to {}/mod.rs failed with {}",
-                dir_name.display(),
-                err
-            )
-        });
+            let mut dir_builder = DirBuilder::new();
+            info!("Creating directory {}", dir_name.display());
+            dir_builder
+                .recursive(true)
+                .create(dir_name)
+                .unwrap_or_else(|err| {
+                    panic!("building {} failed with {}", dir_name.display(), err)
+                });
+
+            let mut sub_self = self.sub_mod(crate_name.as_ref());
+            let folded_crate = noop_fold_crate(&mut sub_self, rust_crate);
+            trace!(
+                "Writing contents of module {} to file {}",
+                crate_name,
+                dir_name.display()
+            );
+
+            write_crate_mod(folded_crate, &dir_name).unwrap_or_else(|err| {
+                panic!(
+                    "writing to {}/mod.rs failed with {}",
+                    dir_name.display(),
+                    err
+                )
+            });
+        }
         Ok(())
     }
 }
@@ -127,8 +181,19 @@ impl<P: AsRef<Path> + Send + Sync> Folder for FileIntoMods<P> {
     }
 }
 
-fn write_crate<P: AsRef<Path>>(rust_crate: Crate, dir_name: &P) -> Result<(), Error> {
+fn write_crate_mod<P: AsRef<Path>>(rust_crate: Crate, dir_name: &P) -> Result<(), Error> {
     let file_name = dir_name.as_ref().join("mod.rs");
+    trace!("Opening file {}", file_name.display());
+    let mut file = File::create(&file_name).context(
+        format_err!("unable to create file {}", file_name.display())
+    )?;
+    trace!("Successfully opened file {}", file_name.display());
+    debug!("Writing to file {}", file_name.display());
+    write_all_tokens(&rust_crate, &mut file)
+}
+
+fn write_crate_crate<P: AsRef<Path>>(rust_crate: Crate, dir_name: &P) -> Result<(), Error> {
+    let file_name = dir_name.as_ref().join("lib.rs");
     trace!("Opening file {}", file_name.display());
     let mut file = File::create(&file_name).context(
         format_err!("unable to create file {}", file_name.display())
